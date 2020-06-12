@@ -273,10 +273,7 @@ class ArrayDB(object):
         return self[index]
 
     def __get_size(self) -> int:
-        if self.__is_defective_revision():
-            return self.__legacy_size
-        else:
-            return self.__get_size_from_db()
+        return self.__get_size_from_db()
 
     def __get_size_from_db(self) -> int:
         return ContainerUtil.decode_object(self._db.get(self.__SIZE_BYTE_KEY), int)
