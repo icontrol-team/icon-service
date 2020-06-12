@@ -13,13 +13,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import TYPE_CHECKING, Optional, Tuple, Iterable
+from typing import TYPE_CHECKING, Optional, Tuple, Iterable, Union
 
 import plyvel
-from iconcommons.logger import Logger
 
+from iconcommons.logger import Logger
 from .batch import TransactionBatchValue
-from ..base.exception import DatabaseException, InvalidParamsException, AccessDeniedException
+from .score_db.score_db import ScoreDBv2, ScoreDBv1, ScoreSubDBv2, ScoreSubDBv1
+from ..base.exception import DatabaseException, InvalidParamsException
 from ..icon_constant import ICON_DB_LOG_TAG, IconScoreContextType, Revision
 from ..iconscore.context.context import ContextGetter
 
@@ -369,150 +370,64 @@ class IconScoreDatabase(ContextGetter):
             address: 'Address',
             context_db: 'ContextDatabase'
     ):
-        """Constructor
+        if self.is_v2:
+            self._db = ScoreDBv2(
+                address=address,
+                context_db=context_db
+            )
+        else:
+            self._db = ScoreDBv1(
+                address=address,
+                context_db=context_db
+            )
 
-        :param address: the address of SCORE which this db is assigned to
-        :param context_db: ContextDatabase
-        """
-        self.address = address
-        self._context_db = context_db
-        self._observer: Optional[DatabaseObserver] = None
-
-        self._prefix: bytes = address.to_bytes()
+    @property
+    def address(self) -> 'Address':
+        return self._db.address
 
     @property
     def is_root(self) -> bool:
-        return True
+        return self._db.is_root
 
     @property
-    def revision(self) -> int:
+    def is_v2(self) -> bool:
+        return self._revision >= Revision.CONTAINER_DB_RLP.value
+
+    @property
+    def _revision(self) -> int:
         if self._context.is_revision_changed(Revision.CONTAINER_DB_RLP.value):
             return self._context.revision - 1
         else:
             return self._context.revision
 
     def get(self, key: bytes) -> bytes:
-        encoded_key: list = self._encoded_key(key)
-        return self._get(encoded_key)
-
-    def _get(self, key: list) -> bytes:
-        """
-        Gets the value for the specified key
-
-        :param key: key to retrieve
-        :return: value for the specified key, or None if not found
-        """
-        hashed_key: list = self._hash_key(key)
-        value: Optional[bytes] = self._context_db.get(self._context, hashed_key[0])
-
-        if self.revision >= Revision.CONTAINER_DB_RLP.value:
-            if value is None:
-                value: Optional[bytes] = self._context_db.get(self._context, hashed_key[1])
-
-        if self._observer:
-            self._observer.on_get(self._context, key[0], value)
-        return value
+        # TODO Versioning Migration
+        # TODO Must find old key after new key access in advance
+        return self._db.get(key)
 
     def put(self, key: bytes, value: bytes):
-        encoded_key: list = self._encoded_key(key)
-        self._put(encoded_key, value)
-
-    def _put(self, key: list, value: bytes):
-        """
-        Sets a value for the specified key.
-
-        :param key: key to set
-        :param value: value to set
-        """
-
-        self._validate_ownership()
-
-        hashed_key: list = self._hash_key(key)
-
-        if self._observer:
-            old_value = self._context_db.get(self._context, hashed_key[0])
-
-            if value:
-                self._observer.on_put(self._context, key[0], old_value, value)
-            elif old_value:
-                # If new value is None, then deletes the field
-                self._observer.on_delete(self._context, key[0], old_value)
-
-        self._context_db.put(self._context, hashed_key[0], value)
+        self._db.put(key, value)
 
     def get_sub_db(self, prefix: bytes) -> 'IconScoreSubDatabase':
-        encoded_key: list = self._encoded_key(prefix)
-        return self._get_sub_db(encoded_key)
-
-    def _get_sub_db(self, prefix: list) -> 'IconScoreSubDatabase':
-        """
-        Returns sub db with a prefix
-
-        :param prefix: The prefix used by this sub db.
-        :return: sub db
-        """
-        if not prefix:
+        if prefix is None:
             raise InvalidParamsException(
                 'Invalid params: '
                 'prefix is None in IconScoreDatabase.get_sub_db()')
 
-        return IconScoreSubDatabase(self.address, self, prefix)
+        return IconScoreSubDatabase(
+            address=self._db.address,
+            score_db=self,
+            prefix=prefix
+        )
 
     def delete(self, key: bytes):
-        encoded_key: list = self._encoded_key(key)
-        self._delete(encoded_key)
-
-    def _delete(self, key: list):
-        """
-        Deletes the key/value pair for the specified key.
-
-        :param key: key to delete
-        """
-        self._validate_ownership()
-
-        hashed_key: list = self._hash_key(key)
-
-        if self._observer:
-            old_value = self._context_db.get(self._context, hashed_key[0])
-            # If old value is None, won't fire the callback
-            if old_value:
-                self._observer.on_delete(self._context, key[0], old_value)
-        self._context_db.delete(self._context, hashed_key[0])
+        self._db.delete(key)
 
     def close(self):
-        self._context_db.close(self._context)
+        self._db.close()
 
     def set_observer(self, observer: 'DatabaseObserver'):
-        self._observer = observer
-
-    def _hash_key(self, key: list) -> list:
-        """All key is hashed and stored
-        to StateDB to avoid key conflicts among SCOREs
-
-        :params key: key passed by SCORE
-        :return: key bytes
-        """
-
-        if self.revision < Revision.CONTAINER_DB_RLP.value:
-            key_v1: bytes = b'|'.join((self._prefix, key[0]))
-            return [key_v1]
-        else:
-            key_v2: bytes = b''.join((self._prefix, key[0]))
-            key_v1: bytes = b'|'.join((self._prefix, key[1]))
-            return [key_v2, key_v1]
-
-    def _validate_ownership(self):
-        """Prevent a SCORE from accessing the database of another SCORE
-
-        """
-        if self._context.current_address != self.address:
-            raise AccessDeniedException(f"Invalid database ownership: {self._context.current_address}, {self.address}")
-
-    def _encoded_key(self, key: bytes) -> list:
-        if self.revision < Revision.CONTAINER_DB_RLP.value:
-            return [key]
-        else:
-            return [key, key]
+        self._db.set_observer(observer)
 
 
 class IconScoreSubDatabase:
@@ -520,109 +435,50 @@ class IconScoreSubDatabase:
     def __init__(
             self,
             address: 'Address',
-            score_db: 'IconScoreDatabase',
-            prefix: list
+            score_db: Union['IconScoreDatabase', 'IconScoreSubDatabase'],
+            prefix: bytes
     ):
-        """Constructor
-
-        :param address: the address of SCORE which this db is assigned to
-        :param score_db: IconScoreDatabase
-        :param prefix:
-        """
-        if not prefix:
-            raise InvalidParamsException("Invalid prefix")
-
-        self.address: 'Address' = address
-        self._score_db: score_db = score_db
-        self._prefix: list = prefix
+        if score_db.is_v2:
+            self._db = ScoreSubDBv2(
+                address=address,
+                score_db=score_db,
+                prefix=prefix
+            )
+        else:
+            self._db = ScoreSubDBv1(
+                address=address,
+                score_db=score_db,
+                prefix=prefix
+            )
 
     @property
     def is_root(self) -> bool:
-        return False
+        return self._db.is_root
 
     @property
-    def revision(self) -> int:
-        return self._score_db.revision
+    def is_v2(self) -> bool:
+        return self._db.is_v2
 
     def get(self, key: bytes) -> bytes:
-        encoded_key: list = self._encoded_key(key)
-        return self._get(encoded_key)
-
-    def _get(self, key: list) -> bytes:
-        """
-        Gets the value for the specified key
-
-        :param key: key to retrieve
-        :return: value for the specified key, or None if not found
-        """
-        hashed_key: list = self._hash_key(key)
-        return self._score_db._get(hashed_key)
+        return self._db.get(key)
 
     def put(self, key: bytes, value: bytes):
-        encoded_key: list = self._encoded_key(key)
-        self._put(encoded_key, value)
-
-    def _put(self, key: list, value: bytes):
-        """
-        Sets a value for the specified key.
-
-        :param key: key to set
-        :param value: value to set
-        """
-        hashed_key: list = self._hash_key(key)
-        self._score_db._put(hashed_key, value)
+        self._db.put(key, value)
 
     def get_sub_db(self, prefix: bytes) -> 'IconScoreSubDatabase':
-        encoded_key: list = self._encoded_key(prefix)
-        return self._get_sub_db(encoded_key)
-
-    def _get_sub_db(self, prefix: list) -> 'IconScoreSubDatabase':
-        """
-        Returns sub db with a prefix
-
-        :param prefix: The prefix used by this sub db.
-        :return: sub db
-        """
         if prefix is None:
-            raise InvalidParamsException("Invalid prefix")
+            raise InvalidParamsException(
+                'Invalid params: '
+                'prefix is None in IconScoreDatabase.get_sub_db()')
 
-        hashed_key: list = self._hash_key(prefix)
-        return IconScoreSubDatabase(self.address, self._score_db, hashed_key)
+        return IconScoreSubDatabase(
+            address=self._db.address,
+            score_db=self,
+            prefix=prefix
+        )
 
     def delete(self, key: bytes):
-        encoded_key: list = self._encoded_key(key)
-        self._delete(encoded_key)
-
-    def _delete(self, key: list):
-        """
-        Deletes the key/value pair for the specified key.
-
-        :param key: key to delete
-        """
-        hashed_key: list = self._hash_key(key)
-        self._score_db._delete(hashed_key)
+        self._db.delete(key)
 
     def close(self):
-        self._score_db.close()
-
-    def _hash_key(self, key: list) -> list:
-        """All key is hashed and stored
-        to StateDB to avoid key conflicts among SCOREs
-
-        :params key: key passed by SCORE
-        :return: key bytes
-        """
-
-        if self.revision < Revision.CONTAINER_DB_RLP.value:
-            key_v1: bytes = b'|'.join((self._prefix[0], key[0]))
-            return [key_v1]
-        else:
-            key_v2: bytes = b''.join((self._prefix[0], key[0]))
-            key_v1: bytes = b'|'.join((self._prefix[1], key[1]))
-            return [key_v2, key_v1]
-
-    def _encoded_key(self, key: bytes) -> list:
-        if self.revision < Revision.CONTAINER_DB_RLP.value:
-            return [key]
-        else:
-            return [key, key]
+        self._db.close()
